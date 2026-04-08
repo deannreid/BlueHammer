@@ -17,3 +17,9 @@ I7dabkH7iSZflULM+hGUOur0mnAg9Qw=
 -----END PGP SIGNATURE-----
 
 Edit : There are few bugs in the PoC that could prevent it from working, might fix them later.
+
+
+### Fixed Bugs
+- `SamiChangePasswordUser` sets `UF_PASSWORD_EXPIRED` on admin accounts when called via the raw NTLM hash path. The subsequent `LogonUserEx` call was failing with `ERROR_PASSWORD_MUST_CHANGE` (1907) for any admin user, while low-privilege users were unaffected. Fixed by calling `NetUserGetInfo`/`NetUserSetInfo` (level 1008) immediately after the password swap to clear `UF_PASSWORD_EXPIRED` before logon is attempted.
+- `GetTokenInformation` was called unconditionally after `LogonUserEx`, dereferencing a NULL token handle when the logon failed. Added `htoken != NULL` guard to prevent the crash on the admin path.
+- Added `#include <lm.h>` and `#pragma comment(lib, "Netapi32.lib")` to support the flag-clearing calls.

